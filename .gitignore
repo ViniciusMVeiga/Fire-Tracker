@@ -1,0 +1,22 @@
+# Compilados e objetos
+*.o
+*.obj
+*.exe
+*.out
+
+# Executáveis do projeto
+pantilt
+pantilt_mock
+test_pid
+test_servo_mock
+
+# VS Code (arquivos locais de configuração do runner/cache)
+.vscode/ipch/
+.vscode/.browse.c_cpp.db*
+
+# Arquivos temporários e do SO
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
