@@ -96,13 +96,13 @@ inline constexpr double PID_X_KI   = 0.0001;  ///< Ganho integral     [ms/(px·s
 inline constexpr double PID_X_KD   = 0.0005;  ///< Ganho derivativo   [ms·s/px]
 
 /// Largura de pulso de referência (polarização) para o eixo pan [ms].
-/// Valor inicial: 1.5 ms (posição neutra aproximada). Validar com o servo real.
 inline constexpr double PID_X_BIAS_MS  = 1.5;
 
 /// Limites da saída em ms (pulso mínimo e máximo para o servo pan).
-inline constexpr double PID_X_OUT_MIN_MS = 1.0;
-inline constexpr double PID_X_OUT_MAX_MS = 2.0;
-
+/// Range conservador para manter o monitor sempre no campo de visão.
+/// Ajuste conforme o alcance físico necessário (use calibrate_servo para medir).
+inline constexpr double PID_X_OUT_MIN_MS = 1.2;
+inline constexpr double PID_X_OUT_MAX_MS = 1.8;
 /// Limite do acumulador integral (anti-windup por clamping).
 inline constexpr double PID_X_INT_LIMIT_MS = 0.4;
 
@@ -119,11 +119,15 @@ inline constexpr double PID_Y_KI   = 0.0001;
 inline constexpr double PID_Y_KD   = 0.0005;
 
 /// Largura de pulso de referência para o eixo tilt [ms].
+/// ATENÇÃO: ajuste este valor até a câmera apontar horizontalmente (para frente).
+/// Se o servo vai para baixo em 1.5 ms, tente valores menores (ex: 1.0, 1.2).
 inline constexpr double PID_Y_BIAS_MS  = 1.5;
 
 /// Limites da saída em ms.
-inline constexpr double PID_Y_OUT_MIN_MS = 1.0;
-inline constexpr double PID_Y_OUT_MAX_MS = 2.0;
+/// Range conservador para manter o monitor sempre no campo de visão.
+/// Ajuste conforme o alcance físico necessário (use calibrate_servo para medir).
+inline constexpr double PID_Y_OUT_MIN_MS = 1.2;
+inline constexpr double PID_Y_OUT_MAX_MS = 1.8;
 
 /// Limite do acumulador integral (anti-windup por clamping).
 inline constexpr double PID_Y_INT_LIMIT_MS = 0.4;
@@ -137,19 +141,29 @@ inline constexpr bool PID_Y_INVERT = true;
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Pino GPIO BCM para o servo pan (eixo X).
-/// GPIO 12 possui suporte a PWM de hardware no RPi 4.
+/// Pino físico 32 — GPIO 12 (PWM0, ALT0) com suporte a PWM de hardware no RPi 4.
 inline constexpr unsigned int SERVO_PAN_GPIO  = 12;
 
 /// Pino GPIO BCM para o servo tilt (eixo Y).
-/// GPIO 13 possui suporte a PWM de hardware no RPi 4.
+/// Pino físico 33 — GPIO 13 (PWM1, ALT0) com suporte a PWM de hardware no RPi 4.
 inline constexpr unsigned int SERVO_TILT_GPIO = 13;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ATUADORES — LASER KY-008 via pigpio
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Pino GPIO BCM para o sinal do módulo laser KY-008.
+/// Pino físico 37 — GPIO 26 (qualquer GPIO livre, saída digital).
+/// Nível ALTO  → laser ligado.
+/// Nível BAIXO → laser desligado.
+inline constexpr unsigned int LASER_GPIO = 26;
 
 /// Frequência do sinal PWM para servos RC [Hz].
 /// 50 Hz é o padrão para servos analógicos como o MG90S (período = 20 ms).
 inline constexpr unsigned int SERVO_PWM_FREQ_HZ = 50;
 
 /// Largura de pulso segura aplicada ao encerrar o sistema [ms].
-/// Posição neutra (≈ 90°). Validar com a montagem física.
+/// Deve corresponder ao mesmo valor de PID_Y_BIAS_MS (câmera apontando para frente).
 inline constexpr double SERVO_SAFE_PULSE_MS = 1.5;
 
 /// Largura de pulso mínima absoluta permitida pelo hardware [ms].

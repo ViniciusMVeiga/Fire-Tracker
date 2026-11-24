@@ -31,7 +31,8 @@ PIGPIO_LIBS := -lpigpio -lrt -lpthread
 SRCS := main.cpp \
         Image_Processing/Image_Processor.cpp \
         Control/Pid_Controller.cpp \
-        Actuators/Servo_Driver.cpp
+        Actuators/Servo_Driver.cpp \
+        Actuators/Laser_Driver.cpp
 
 TARGET := pantilt
 
@@ -82,10 +83,17 @@ $(TEST_SERVO_BIN): $(TEST_SERVO_SRCS)
 	$(CXX) $(CXXFLAGS) -DHARDWARE_MOCK -I. $^ -o $@
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Ferramentas auxiliares
+# ─────────────────────────────────────────────────────────────────────────────
+calibrate_servo: tools/calibrate_servo.cpp
+	$(CXX) $(CXXFLAGS) -I. $< -o $@ $(PIGPIO_LIBS)
+	@echo "Compilado: calibrate_servo"
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Limpeza
 # ─────────────────────────────────────────────────────────────────────────────
 clean:
-	rm -f $(TARGET) $(TARGET)_mock \
+	rm -f $(TARGET) $(TARGET)_mock calibrate_servo \
 	      $(TEST_PID_BIN) $(TEST_SERVO_BIN)
 
-.PHONY: all mock tests clean
+.PHONY: all mock tests clean calibrate_servo

@@ -73,19 +73,26 @@ bool Image_Processor::initialize()
         mCapture.set(cv::CAP_PROP_FRAME_HEIGHT, mParams.imageHeight);
         mCapture.set(cv::CAP_PROP_FPS,          mParams.cameraFps);
     } else {
-        // Modo real: pipeline GStreamer → libcamera (Raspberry Pi OS Bookworm)
-        const std::string pipeline = build_pipeline();
-        std::cout << "[Image_Processor] Abrindo câmera com pipeline:\n  "
-                  << pipeline << "\n";
+        // Modo real: captura via V4L2 com backend libcamera.
+        // No Raspberry Pi OS Trixie o OpenCV instalado via apt não inclui
+        // suporte a GStreamer; usamos CAP_V4L2 diretamente, que funciona com
+        // a camada de compatibilidade libcamera-v4l2 (/dev/video0).
+        std::cout << "[Image_Processor] Abrindo camera via V4L2 (/dev/video0)...\n";
 
-        mCapture.open(pipeline, cv::CAP_GSTREAMER);
+        mCapture.open(0, cv::CAP_V4L2);
 
         if (!mCapture.isOpened()) {
-            std::cerr << "[Image_Processor] Falha ao abrir pipeline GStreamer.\n"
-                      << "  Verifique se libcamera-apps e o backend GStreamer "
-                         "do OpenCV estão instalados.\n";
+            std::cerr << "[Image_Processor] Falha ao abrir /dev/video0 via V4L2.\n"
+                      << "  Verifique se a camera esta habilitada (raspi-config)\n"
+                      << "  e se /dev/video0 existe (ls /dev/video*).\n";
             return false;
         }
+
+        // Solicita a resolução configurada (o driver pode ajustar para o
+        // modo suportado mais próximo — a resolução efetiva é lida logo abaixo)
+        mCapture.set(cv::CAP_PROP_FRAME_WIDTH,  mParams.imageWidth);
+        mCapture.set(cv::CAP_PROP_FRAME_HEIGHT, mParams.imageHeight);
+        mCapture.set(cv::CAP_PROP_FPS,          mParams.cameraFps);
     }
 
     // Verifica dimensões efetivas

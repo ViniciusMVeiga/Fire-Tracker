@@ -31,6 +31,7 @@
 #include "Image_Processing/Image_Processor.hpp"
 #include "Control/Pid_Controller.hpp"
 #include "Actuators/Servo_Driver.hpp"
+#include "Actuators/Laser_Driver.hpp"
 
 #include <iostream>
 #include <csignal>
@@ -157,11 +158,23 @@ int main()
         return 1;
     }
 
+    // ── 1b. Inicializa o driver do laser ─────────────────────────────────────
+    // ATENÇÃO: o Laser_Driver usa gpioSetMode/gpioWrite e pressupõe que o
+    // pigpio já foi inicializado pelo Servo_Driver acima.
+    Actuators::Laser_Driver laserDriver(Config::LASER_GPIO);
+
+    if (!laserDriver.initialize()) {
+        std::cerr << "[main] Falha na inicialização do laser. Abortando.\n";
+        servoDriver.shutdown();
+        return 1;
+    }
+
     // ── 2. Inicializa o processamento de imagem ──────────────────────────────
     Image_Processing::Image_Processor imageProc(build_image_params());
 
     if (!imageProc.initialize()) {
         std::cerr << "[main] Falha na inicialização da câmera. Abortando.\n";
+        laserDriver.shutdown();
         servoDriver.shutdown();
         return 1;
     }
@@ -172,6 +185,7 @@ int main()
     if (frameSize.width == 0 || frameSize.height == 0) {
         std::cerr << "[main] Dimensões de frame inválidas. Abortando.\n";
         imageProc.shutdown();
+        laserDriver.shutdown();
         servoDriver.shutdown();
         return 1;
     }
@@ -221,6 +235,8 @@ int main()
                 std::cout << "[main] Ciclo " << cycleCount
                           << ": alvo não detectado.\n";
             }
+            // Desliga o laser enquanto o alvo não é detectado
+            laserDriver.turn_off();
             // Reinicia os integradores para evitar windup acumulado sem medição
             pidX.reset();
             pidY.reset();
@@ -233,6 +249,9 @@ int main()
 
         // ── 5c. Calcula e envia comandos somente com medição válida ──────────
         if (validMeas) {
+            // Liga o laser ao detectar o alvo
+            laserDriver.turn_on();
+
             // Erros de posição [px]
             const double errorX = xRef - static_cast<double>(meas.x);
             const double errorY = yRef - static_cast<double>(meas.y);
@@ -289,6 +308,7 @@ int main()
               << " | Atrasos: " << missCount << "\n";
 
     imageProc.shutdown();
+    laserDriver.shutdown();   // garante laser desligado antes de encerrar pigpio
     servoDriver.shutdown();   // aplica pulso seguro e encerra pigpio
 
     std::cout << "[main] Sistema encerrado.\n";
