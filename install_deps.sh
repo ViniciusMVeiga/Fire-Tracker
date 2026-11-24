@@ -2,21 +2,16 @@
 # =============================================================================
 # install_deps.sh — Dependências de sistema do Fire-Tracker (Pan-Tilt PID)
 #
-# O projeto é 100% C++: as dependências NÃO são instaláveis via pip. Este
-# script é o equivalente ao "requirements.txt" para a stack de compilação.
+# Compatível com Raspberry Pi OS (Bookworm / Trixie) e PC (Linux/WSL).
+#
+# O projeto é 100% C++: as dependências de sistema são instaladas via apt e,
+# no caso do pigpio em distros mais novas (Debian 13 Trixie), compiladas
+# automaticamente a partir do código-fonte oficial.
 #
 # Uso:
-#   ./install_deps.sh            # instala tudo (Raspberry Pi: CSI + GPIO)
-#   ./install_deps.sh --mock     # só o necessário para PC (OpenCV + toolchain)
+#   ./install_deps.sh            # instala tudo (Raspberry Pi: Câmera + Servos + Laser)
+#   ./install_deps.sh --mock     # só o necessário para PC (OpenCV + toolchain de compilação)
 #   ./install_deps.sh --check    # apenas verifica o que já está instalado
-#
-# Modos:
-#   full  → build-essential, pkg-config, OpenCV, pigpio, GStreamer
-#   mock  → build-essential, pkg-config, OpenCV  (make mock / make tests)
-#
-# Referências:
-#   - Makefile (OPENCV_CFLAGS, PIGPIO_LIBS)
-#   - Config/config.hpp (pipeline GStreamer com libcamerasrc)
 # =============================================================================
 
 set -euo pipefail
@@ -25,7 +20,7 @@ MODE="full"
 CHECK_ONLY=0
 
 usage() {
-    sed -n '3,18p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '3,15p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 for arg in "$@"; do
@@ -49,29 +44,14 @@ is_raspberry_pi() {
         tr -d '\0' < /proc/device-tree/model | grep -qi 'raspberry pi'
 }
 
+find_v4l2_compat() {
+    find /usr/libexec /usr/lib -name "v4l2-compat.so" 2>/dev/null | head -n 1 || true
+}
+
 if [[ $EUID -eq 0 ]]; then
     SUDO=()
 else
     SUDO=(sudo)
-fi
-
-# ─── Pacotes por modo ────────────────────────────────────────────────────────
-
-BASE_PKGS=(build-essential pkg-config)
-OPENCV_PKGS=(libopencv-dev)
-PIGPIO_PKGS=(libpigpio-dev pigpio)
-GST_PKGS=(libgstreamer1.0-dev gstreamer1.0-plugins-bad gstreamer1.0-libav)
-
-PKGS=("${BASE_PKGS[@]}" "${OPENCV_PKGS[@]}")
-
-if [[ "$MODE" == "full" ]]; then
-    PKGS+=("${PIGPIO_PKGS[@]}" "${GST_PKGS[@]}")
-
-    # O plugin libcamerasrc (usado em Config::GSTREAMER_PIPELINE_TEMPLATE)
-    # vem em pacote separado no Raspberry Pi OS Bookworm.
-    if is_raspberry_pi && apt-cache show gstreamer1.0-libcamera >/dev/null 2>&1; then
-        PKGS+=(gstreamer1.0-libcamera)
-    fi
 fi
 
 # ─── Verificação ─────────────────────────────────────────────────────────────
@@ -91,25 +71,29 @@ check_item() {
 
 verify() {
     FAILURES=0
+    echo "=================================================="
     echo "Verificando dependências (modo: $MODE)..."
+    echo "=================================================="
 
     check_item "compilador g++"            g++ --version
     check_item "make"                      make --version
     check_item "pkg-config"                pkg-config --version
+    check_item "git"                       git --version
     check_item "OpenCV 4 (C++ headers)"    pkg-config --exists opencv4
 
     if [[ "$MODE" == "full" ]]; then
-        check_item "pigpio (pigpio.h)"     test -f /usr/include/pigpio.h
-        check_item "GStreamer 1.0 (dev)"   pkg-config --exists gstreamer-1.0
+        # pigpio.h pode estar em /usr/include ou /usr/local/include
+        check_item "pigpio (pigpio.h)"     bash -c "test -f /usr/include/pigpio.h || test -f /usr/local/include/pigpio.h"
+        check_item "biblioteca libpigpio"  bash -c "ldconfig -p | grep -q libpigpio || test -f /usr/local/lib/libpigpio.so"
 
         if is_raspberry_pi; then
-            check_item "plugin libcamerasrc" gst-inspect-1.0 libcamerasrc
+            check_item "v4l2-compat.so (libcamera-v4l2)" bash -c "test -n \"\$(find_v4l2_compat)\""
         fi
     fi
 
     echo
     if [[ $FAILURES -eq 0 ]]; then
-        echo "Tudo pronto."
+        echo "Todas as dependências estão presentes e prontas!"
         return 0
     fi
     echo "$FAILURES dependência(s) faltando."
@@ -129,60 +113,90 @@ if ! command -v apt-get >/dev/null 2>&1; then
 fi
 
 if [[ "$MODE" == "full" ]] && ! is_raspberry_pi; then
-    echo "aviso: este não parece ser um Raspberry Pi."
-    echo "       pigpio e a câmera CSI podem não funcionar aqui."
-    echo "       Para desenvolver no PC, use: ./install_deps.sh --mock"
+    echo "aviso: este computador não parece ser um Raspberry Pi."
+    echo "       GPIOs reais e a câmera CSI requerem hardware da Raspberry Pi."
+    echo "       Para desenvolver e testar no PC, use: ./install_deps.sh --mock"
     echo
 fi
 
-echo "Atualizando lista de pacotes..."
+echo "Atualizando listas do apt..."
 "${SUDO[@]}" apt-get update
 
-# Instala apenas o que existe no repositório, avisando sobre o restante.
-AVAILABLE=()
-MISSING=()
-for pkg in "${PKGS[@]}"; do
-    if apt-cache show "$pkg" >/dev/null 2>&1; then
-        AVAILABLE+=("$pkg")
-    else
-        MISSING+=("$pkg")
-    fi
-done
+BASE_PKGS=(build-essential pkg-config git)
+OPENCV_PKGS=(libopencv-dev)
+HARDWARE_PKGS=()
 
-if [[ ${#AVAILABLE[@]} -gt 0 ]]; then
-    echo
-    echo "Instalando: ${AVAILABLE[*]}"
-    "${SUDO[@]}" apt-get install -y "${AVAILABLE[@]}"
+if [[ "$MODE" == "full" ]]; then
+    # Suporte a v4l2-compat para a Raspberry Pi Camera
+    if apt-cache show libcamera-v4l2 >/dev/null 2>&1; then
+        HARDWARE_PKGS+=(libcamera-v4l2)
+    fi
+
+    # Se o pacote pigpio estiver nos repositórios (Debian Bookworm/Bullseye), adiciona
+    if apt-cache show libpigpio-dev >/dev/null 2>&1; then
+        HARDWARE_PKGS+=(libpigpio-dev pigpio)
+    fi
 fi
 
-if [[ ${#MISSING[@]} -gt 0 ]]; then
-    echo
-    echo "aviso: pacotes indisponíveis neste repositório: ${MISSING[*]}" >&2
-    case "$MODE" in
-        full)
-            echo "       No PC, use --mock; no Raspberry Pi OS, verifique se os" >&2
-            echo "       repositórios universe/raspi estão habilitados." >&2
-            ;;
-    esac
+PKGS=("${BASE_PKGS[@]}" "${OPENCV_PKGS[@]}" "${HARDWARE_PKGS[@]}")
+
+echo
+echo "Instalando pacotes via apt: ${PKGS[*]}"
+"${SUDO[@]}" apt-get install -y "${PKGS[@]}"
+
+# ─── Compilação do pigpio da fonte (se necessário) ───────────────────────────
+if [[ "$MODE" == "full" ]]; then
+    if ! test -f /usr/include/pigpio.h && ! test -f /usr/local/include/pigpio.h; then
+        echo
+        echo "libpigpio não encontrada nos repositórios apt (comum no Debian Trixie)."
+        echo "Baixando e compilando pigpio a partir do código-fonte oficial..."
+
+        BUILD_DIR=$(mktemp -d)
+        git clone --depth 1 https://github.com/joan2937/pigpio.git "$BUILD_DIR/pigpio"
+        pushd "$BUILD_DIR/pigpio" >/dev/null
+        make -j"$(nproc)"
+        "${SUDO[@]}" make install
+        "${SUDO[@]}" ldconfig
+        popd >/dev/null
+        rm -rf "$BUILD_DIR"
+        echo "pigpio instalado com sucesso a partir da fonte!"
+    fi
 fi
 
 echo
 if ! verify; then
     echo
-    echo "Algumas dependências continuam faltando. Veja as mensagens acima." >&2
+    echo "Aviso: Algumas dependências ainda não foram identificadas. Verifique as mensagens acima." >&2
     exit 1
 fi
 
+V4L2_PATH=$(find_v4l2_compat)
+
 echo
-echo "Próximos passos:"
+echo "=================================================="
+echo "Instalação concluída com sucesso!"
+echo "=================================================="
+echo "Próximos passos para compilar e executar:"
 case "$MODE" in
     full)
-        echo "  make            # compila o programa principal (pantilt)"
-        echo "  sudo ./pantilt  # executa com GPIO e câmera reais"
+        echo "  1. Compilar o projeto:"
+        echo "       make"
+        echo
+        echo "  2. Compilar ferramentas auxiliares (opcional):"
+        echo "       make calibrate_servo"
+        echo "       make view_camera"
+        echo
+        echo "  3. Executar o rastreador de fogo:"
+        if [[ -n "$V4L2_PATH" ]]; then
+            echo "       sudo env LD_PRELOAD=$V4L2_PATH ./pantilt"
+        else
+            echo "       sudo ./pantilt"
+        fi
         ;;
     mock)
-        echo "  make mock       # compila sem GPIO/câmera do RPi"
-        echo "  ./pantilt_mock  # executa em modo simulado"
+        echo "  make mock       # compila sem GPIO/câmera real"
+        echo "  ./pantilt_mock  # executa em modo simulado no PC"
+        echo "  make tests      # executa os testes unitários automatizados"
         ;;
 esac
-echo "  make tests      # testes automatizados (sem hardware)"
+echo "=================================================="
