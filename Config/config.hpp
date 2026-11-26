@@ -87,7 +87,7 @@ inline constexpr double MAX_MEASUREMENT_AGE_S = 0.2;
 /// Período de amostragem do loop de controle em segundos (Ts).
 /// Deve ser maior que o tempo típico de processamento de imagem.
 /// Valor inicial: 50 ms → 20 Hz.
-inline constexpr double SAMPLE_PERIOD_S = 0.05;
+inline constexpr double SAMPLE_PERIOD_S = 0.1;
 
 /// Divisor de taxa para atualização da interface gráfica no pantilt.
 /// 1 = atualiza em todo ciclo (20 Hz); 2 = atualiza a cada 2 ciclos (10 Hz).
@@ -101,8 +101,8 @@ inline constexpr int GUI_UPDATE_DIVIDER = 2;
 /// funcional. Devem ser calibrados experimentalmente antes da operação real.
 
 inline constexpr double PID_X_KP   = 0.001;   ///< Ganho proporcional [ms/px]
-inline constexpr double PID_X_KI   = 0.0001;  ///< Ganho integral     [ms/(px·s)]
-inline constexpr double PID_X_KD   = 0.0005;  ///< Ganho derivativo   [ms·s/px]
+inline constexpr double PID_X_KI   = 0.001;  ///< Ganho integral     [ms/(px·s)]
+inline constexpr double PID_X_KD   = 0.000;  ///< Ganho derivativo   [ms·s/px]
 
 /// Largura de pulso de referência (polarização) para o eixo pan [ms].
 inline constexpr double PID_X_BIAS_MS  = 1.540;
@@ -124,8 +124,8 @@ inline constexpr bool PID_X_INVERT = false;
 /// ATENÇÃO: Ganhos PROVISÓRIOS — calibrar experimentalmente.
 
 inline constexpr double PID_Y_KP   = 0.001;
-inline constexpr double PID_Y_KI   = 0.0001;
-inline constexpr double PID_Y_KD   = 0.0005;
+inline constexpr double PID_Y_KI   = 0.001;
+inline constexpr double PID_Y_KD   = 0.000;
 
 /// Largura de pulso de referência para o eixo tilt [ms].
 /// ATENÇÃO: ajuste este valor até a câmera apontar horizontalmente (para frente).
