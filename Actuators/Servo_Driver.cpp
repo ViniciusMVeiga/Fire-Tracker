@@ -117,8 +117,8 @@ bool Servo_Driver::initialize()
     mInitialized = true;
 
     // Aplica pulso seguro (posição neutra) em ambos os servos
-    const bool okPan  = set_pan_pulse(mParams.safePulseMs);
-    const bool okTilt = set_tilt_pulse(mParams.safePulseMs);
+    const bool okPan  = set_pan_pulse(mParams.panSafePulseMs);
+    const bool okTilt = set_tilt_pulse(mParams.tiltSafePulseMs);
 
     if (!okPan || !okTilt) {
         std::cerr << "[Servo_Driver] Falha ao aplicar pulso seguro inicial.\n";
@@ -128,9 +128,9 @@ bool Servo_Driver::initialize()
 
     std::cout << "[Servo_Driver] Servos inicializados.\n"
               << "  Pan  → GPIO " << mParams.panGpio
-              << ", pulso seguro " << mParams.safePulseMs << " ms\n"
+              << ", pulso seguro " << mParams.panSafePulseMs << " ms\n"
               << "  Tilt → GPIO " << mParams.tiltGpio
-              << ", pulso seguro " << mParams.safePulseMs << " ms\n";
+              << ", pulso seguro " << mParams.tiltSafePulseMs << " ms\n";
 
     return true;
 }
@@ -197,10 +197,13 @@ void Servo_Driver::shutdown()
     }
 
     // Aplica pulso seguro antes de parar
-    unsigned int safeUs = 0;
-    if (validate_and_convert(mParams.safePulseMs, safeUs)) {
-        send_pulse(mParams.panGpio,  safeUs);
-        send_pulse(mParams.tiltGpio, safeUs);
+    unsigned int safePanUs = 0;
+    if (validate_and_convert(mParams.panSafePulseMs, safePanUs)) {
+        send_pulse(mParams.panGpio, safePanUs);
+    }
+    unsigned int safeTiltUs = 0;
+    if (validate_and_convert(mParams.tiltSafePulseMs, safeTiltUs)) {
+        send_pulse(mParams.tiltGpio, safeTiltUs);
     }
 
     // Para os sinais PWM

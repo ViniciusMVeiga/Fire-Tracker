@@ -38,9 +38,10 @@ struct Servo_Params {
 
     unsigned int pwmFreqHz = 50; ///< Frequência PWM [Hz] — 50 Hz padrão RC
 
-    double safePulseMs = 1.5;    ///< Pulso aplicado na inicialização e encerramento
-    double absMinMs    = 0.8;    ///< Limite mínimo absoluto de pulso [ms]
-    double absMaxMs    = 2.2;    ///< Limite máximo absoluto de pulso [ms]
+    double panSafePulseMs  = 1.5; ///< Pulso aplicado ao pan na inicialização e encerramento
+    double tiltSafePulseMs = 1.5; ///< Pulso aplicado ao tilt na inicialização e encerramento
+    double absMinMs        = 0.8; ///< Limite mínimo absoluto de pulso [ms]
+    double absMaxMs        = 2.2; ///< Limite máximo absoluto de pulso [ms]
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -74,7 +75,7 @@ public:
     /**
      * @brief Inicializa pigpio e configura os pinos.
      *
-     * Aplica o pulso seguro (safePulseMs) em ambos os servos após a init.
+     * Aplica o pulso seguro (panSafePulseMs e tiltSafePulseMs) em cada servo após a init.
      *
      * @return true em caso de sucesso.
      */

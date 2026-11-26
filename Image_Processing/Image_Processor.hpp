@@ -30,9 +30,14 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <string>
 #include <optional>
+#include <thread>
+#include <sys/types.h>
 
 #include <opencv2/core.hpp>
 #include <opencv2/videoio.hpp>
@@ -77,6 +82,9 @@ struct Detection_Params {
         "libcamerasrc ! "
         "video/x-raw,width=%d,height=%d,framerate=%d/1,format=BGR ! "
         "appsink drop=true max-buffers=1";
+
+    /// Se true, rotaciona a imagem em 180° (câmera de cabeça para baixo).
+    bool rotate180 = false;
 
     /// Se true, usa webcam /dev/video0 em vez do pipeline GStreamer.
     /// Útil para desenvolvimento sem câmera RPi.
@@ -179,6 +187,23 @@ private:
     cv::Mat mLastMask;    ///< Última máscara binária
 
     bool mInitialized = false;
+
+    // Captura nativa Raspberry Pi via pipe (rpicam-vid / libcamera-vid)
+    bool                    mUsingRpicamPipe = false;
+    pid_t                   mCameraPid       = -1;
+    int                     mPipeFd          = -1;
+    std::thread             mReaderThread;
+    std::atomic<bool>       mStopping{false};
+    std::mutex              mFrameMutex;
+    std::condition_variable mFrameCv;
+    cv::Mat                 mPendingFrame;
+    bool                    mHasNewFrame     = false;
+    bool                    mReaderEnded     = false;
+    std::chrono::steady_clock::time_point mPendingTimestamp{};
+
+    bool start_rpicam_pipe();
+    void stop_rpicam_pipe();
+    void reader_loop();
 
     /// Monta a string do pipeline GStreamer com as dimensões configuradas.
     std::string build_pipeline() const;

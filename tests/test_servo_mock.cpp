@@ -45,12 +45,13 @@ static bool near(double a, double b, double tol = 1e-6)
 static Actuators::Servo_Params make_params()
 {
     Actuators::Servo_Params p;
-    p.panGpio    = 12;
-    p.tiltGpio   = 13;
-    p.pwmFreqHz  = 50;
-    p.safePulseMs = 1.5;
-    p.absMinMs   = 0.8;
-    p.absMaxMs   = 2.2;
+    p.panGpio         = 12;
+    p.tiltGpio        = 13;
+    p.pwmFreqHz       = 50;
+    p.panSafePulseMs  = 1.54;
+    p.tiltSafePulseMs = 1.30;
+    p.absMinMs        = 0.8;
+    p.absMaxMs        = 2.2;
     return p;
 }
 
@@ -62,6 +63,8 @@ static void test_initialize()
     bool ok = drv.initialize();
     check(ok, "initialize() retorna true");
     check(drv.is_initialized(), "is_initialized() = true após init");
+    check(near(drv.get_pan_pulse_ms(),  1.54), "panSafePulseMs aplicado na init (1.54)");
+    check(near(drv.get_tilt_pulse_ms(), 1.30), "tiltSafePulseMs aplicado na init (1.30)");
     drv.shutdown();
     check(!drv.is_initialized(), "is_initialized() = false após shutdown");
 }

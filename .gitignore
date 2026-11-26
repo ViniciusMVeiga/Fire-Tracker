@@ -4,9 +4,14 @@
 *.exe
 *.out
 
+# Ambientes 
+.venv 
+
 # Executáveis do projeto
 pantilt
 pantilt_mock
+calibrate_servo
+view_camera
 test_pid
 test_servo_mock
 

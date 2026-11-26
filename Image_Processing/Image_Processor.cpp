@@ -23,14 +23,71 @@
 
 #include "Image_Processor.hpp"
 
+#include <cerrno>
+#include <csignal>
 #include <cstdio>       // snprintf
-#include <stdexcept>
+#include <cstdlib>      // getenv
 #include <iostream>
+#include <sstream>
+#include <stdexcept>
+#include <vector>
+
+#include <sys/prctl.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <opencv2/imgproc.hpp>
 #include <opencv2/videoio.hpp>
 
 namespace Image_Processing {
+
+namespace {
+
+std::string find_executable_in_path(const char* name)
+{
+    const char* pathEnv = std::getenv("PATH");
+    const std::string searchPath = pathEnv ? pathEnv : "/usr/local/bin:/usr/bin:/bin";
+
+    std::stringstream ss(searchPath);
+    std::string dir;
+    while (std::getline(ss, dir, ':')) {
+        if (dir.empty()) {
+            continue;
+        }
+        const std::string candidate = dir + "/" + name;
+        if (::access(candidate.c_str(), X_OK) == 0) {
+            return candidate;
+        }
+    }
+    return {};
+}
+
+std::string find_rpicam_executable()
+{
+    std::string exe = find_executable_in_path("rpicam-vid");
+    if (!exe.empty()) {
+        return exe;
+    }
+    return find_executable_in_path("libcamera-vid");
+}
+
+bool read_exact(int fd, unsigned char* dst, std::size_t totalBytes)
+{
+    std::size_t offset = 0;
+    while (offset < totalBytes) {
+        const ssize_t n = ::read(fd, dst + offset, totalBytes - offset);
+        if (n > 0) {
+            offset += static_cast<std::size_t>(n);
+        } else if (n == 0) {
+            return false; // EOF
+        } else if (errno != EINTR) {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Construtor / Destrutor
@@ -73,23 +130,31 @@ bool Image_Processor::initialize()
         mCapture.set(cv::CAP_PROP_FRAME_HEIGHT, mParams.imageHeight);
         mCapture.set(cv::CAP_PROP_FPS,          mParams.cameraFps);
     } else {
-        // Modo real: captura via V4L2 com backend libcamera.
-        // No Raspberry Pi OS Trixie o OpenCV instalado via apt não inclui
-        // suporte a GStreamer; usamos CAP_V4L2 diretamente, que funciona com
-        // a camada de compatibilidade libcamera-v4l2 (/dev/video0).
-        std::cout << "[Image_Processor] Abrindo camera via V4L2 (/dev/video0)...\n";
+        // Modo real (Raspberry Pi 4 + libcamera):
+        // Usa rpicam-vid (ou libcamera-vid) em pipe YUV420 diretamente,
+        // evitando falhas de V4L2 (/dev/video0 unicam) e ausência de GStreamer
+        // no OpenCV empacotado pelo apt.
+        if (start_rpicam_pipe()) {
+            std::cout << "[Image_Processor] Câmera aberta via rpicam-vid/libcamera-vid: "
+                      << mParams.imageWidth << "x" << mParams.imageHeight << " @ "
+                      << mParams.cameraFps << " fps\n";
+            mInitialized = true;
+            return true;
+        }
 
-        mCapture.open(0, cv::CAP_V4L2);
+        // Fallback: tenta GStreamer e por fim V4L2
+        std::cout << "[Image_Processor] Tentando fallback via GStreamer / V4L2...\n";
+        mCapture.open(build_pipeline(), cv::CAP_GSTREAMER);
 
         if (!mCapture.isOpened()) {
-            std::cerr << "[Image_Processor] Falha ao abrir /dev/video0 via V4L2.\n"
-                      << "  Verifique se a camera esta habilitada (raspi-config)\n"
-                      << "  e se /dev/video0 existe (ls /dev/video*).\n";
+            mCapture.open(0, cv::CAP_V4L2);
+        }
+
+        if (!mCapture.isOpened()) {
+            std::cerr << "[Image_Processor] Falha ao abrir câmera (rpicam-vid, GStreamer e V4L2).\n";
             return false;
         }
 
-        // Solicita a resolução configurada (o driver pode ajustar para o
-        // modo suportado mais próximo — a resolução efetiva é lida logo abaixo)
         mCapture.set(cv::CAP_PROP_FRAME_WIDTH,  mParams.imageWidth);
         mCapture.set(cv::CAP_PROP_FRAME_HEIGHT, mParams.imageHeight);
         mCapture.set(cv::CAP_PROP_FPS,          mParams.cameraFps);
@@ -119,6 +184,7 @@ bool Image_Processor::initialize()
 
 void Image_Processor::shutdown()
 {
+    stop_rpicam_pipe();
     if (mCapture.isOpened()) {
         mCapture.release();
     }
@@ -131,6 +197,9 @@ void Image_Processor::shutdown()
 
 bool Image_Processor::is_open() const
 {
+    if (mUsingRpicamPipe) {
+        return mInitialized && !mReaderEnded;
+    }
     return mCapture.isOpened();
 }
 
@@ -162,19 +231,43 @@ Target_Measurement Image_Processor::process_frame()
     result.valid     = false;
     result.timestamp = std::chrono::steady_clock::now();
 
-    if (!mInitialized || !mCapture.isOpened()) {
+    if (!mInitialized || !is_open()) {
         std::cerr << "[Image_Processor] process_frame: câmera não inicializada.\n";
         return result;
     }
 
     // 1. Captura frame
     cv::Mat frame;
-    if (!mCapture.read(frame) || frame.empty()) {
-        std::cerr << "[Image_Processor] Falha ao capturar frame.\n";
-        return result;
+    auto captureTimestamp = std::chrono::steady_clock::now();
+
+    if (mUsingRpicamPipe) {
+        std::unique_lock<std::mutex> lock(mFrameMutex);
+        const bool gotFrame = mFrameCv.wait_for(
+            lock, std::chrono::milliseconds(1000),
+            [this]() {
+                return mHasNewFrame || mReaderEnded || mStopping.load();
+            });
+
+        if (!gotFrame || !mHasNewFrame || mPendingFrame.empty()) {
+            std::cerr << "[Image_Processor] Falha ao capturar frame (pipe rpicam-vid).\n";
+            return result;
+        }
+
+        frame            = std::move(mPendingFrame);
+        captureTimestamp = mPendingTimestamp;
+        mHasNewFrame     = false;
+    } else {
+        if (!mCapture.read(frame) || frame.empty()) {
+            std::cerr << "[Image_Processor] Falha ao capturar frame.\n";
+            return result;
+        }
+        if (mParams.rotate180) {
+            cv::rotate(frame, frame, cv::ROTATE_180);
+        }
+        captureTimestamp = std::chrono::steady_clock::now();
     }
 
-    mLastFrame = frame.clone();
+    mLastFrame = frame;
 
     const int frameW = frame.cols;
     const int frameH = frame.rows;
@@ -190,11 +283,11 @@ Target_Measurement Image_Processor::process_frame()
 
     // 4. Morfologia  (etapa 5 preservada)
     const cv::Mat morphed = step_morphology(mask);
-    mLastMask = morphed.clone();
+    mLastMask = morphed;
 
     // 5. Encontra alvo  (etapas 6 + 7 + 8 preservadas)
     result = step_find_target(morphed, frameW, frameH);
-    result.timestamp = std::chrono::steady_clock::now();
+    result.timestamp = captureTimestamp;
 
     return result;
 }
@@ -238,7 +331,7 @@ cv::Mat Image_Processor::step_hsv_filter(const cv::Mat& blurred) const
  */
 cv::Mat Image_Processor::step_morphology(const cv::Mat& mask) const
 {
-    cv::Mat result = mask.clone();
+    cv::Mat opened, closed;
 
     const cv::Mat elemOpen = cv::getStructuringElement(
         cv::MORPH_ELLIPSE,
@@ -248,10 +341,10 @@ cv::Mat Image_Processor::step_morphology(const cv::Mat& mask) const
         cv::MORPH_ELLIPSE,
         cv::Size(mParams.morphCloseSize, mParams.morphCloseSize));
 
-    cv::morphologyEx(result, result, cv::MORPH_OPEN,  elemOpen);
-    cv::morphologyEx(result, result, cv::MORPH_CLOSE, elemClose);
+    cv::morphologyEx(mask,   opened, cv::MORPH_OPEN,  elemOpen);
+    cv::morphologyEx(opened, closed, cv::MORPH_CLOSE, elemClose);
 
-    return result;
+    return closed;
 }
 
 /**
@@ -265,9 +358,9 @@ Target_Measurement Image_Processor::step_find_target(
     result.frameWidth  = frameW;
     result.frameHeight = frameH;
 
-    // Etapa 6: encontra contornos externos
+    // Etapa 6: encontra contornos externos (OpenCV 4 não altera a matriz fonte)
     std::vector<std::vector<cv::Point>> contours;
-    cv::findContours(mask.clone(), contours,
+    cv::findContours(mask, contours,
                      cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
     // Etapa 7: seleciona o maior contorno
@@ -307,6 +400,176 @@ Target_Measurement Image_Processor::step_find_target(
 // ─────────────────────────────────────────────────────────────────────────────
 // Utilitários privados
 // ─────────────────────────────────────────────────────────────────────────────
+
+bool Image_Processor::start_rpicam_pipe()
+{
+    if (mParams.imageWidth <= 0 || mParams.imageHeight <= 0 ||
+        (mParams.imageWidth % 2) != 0 || (mParams.imageHeight % 2) != 0) {
+        std::cerr << "[Image_Processor] Dimensões inválidas para YUV420: "
+                  << mParams.imageWidth << "x" << mParams.imageHeight << "\n";
+        return false;
+    }
+
+    const std::string exePath = find_rpicam_executable();
+    if (exePath.empty()) {
+        std::cerr << "[Image_Processor] rpicam-vid/libcamera-vid não encontrado no PATH.\n";
+        return false;
+    }
+
+    int pipefd[2] = {-1, -1};
+    if (::pipe(pipefd) != 0) {
+        std::cerr << "[Image_Processor] Falha ao criar pipe para câmera.\n";
+        return false;
+    }
+
+    const pid_t parentPid = ::getpid();
+    const pid_t pid = ::fork();
+    if (pid < 0) {
+        std::cerr << "[Image_Processor] Falha no fork() para iniciar " << exePath << ".\n";
+        ::close(pipefd[0]);
+        ::close(pipefd[1]);
+        return false;
+    }
+
+    if (pid == 0) {
+        ::prctl(PR_SET_PDEATHSIG, SIGTERM);
+        if (::getppid() != parentPid) {
+            ::_exit(127);
+        }
+
+        ::dup2(pipefd[1], STDOUT_FILENO);
+        ::close(pipefd[0]);
+        ::close(pipefd[1]);
+
+        std::vector<std::string> args = {
+            exePath,
+            "--nopreview",
+            "-t", "0",
+            "--width", std::to_string(mParams.imageWidth),
+            "--height", std::to_string(mParams.imageHeight),
+            "--framerate", std::to_string(static_cast<int>(mParams.cameraFps)),
+            "--codec", "yuv420",
+            "--flush",
+            "-o", "-"
+        };
+        if (mParams.rotate180) {
+            args.push_back("--rotation");
+            args.push_back("180");
+        }
+        std::vector<char*> argv;
+        argv.reserve(args.size() + 1);
+        for (auto& arg : args) {
+            argv.push_back(arg.data());
+        }
+        argv.push_back(nullptr);
+
+        ::execv(exePath.c_str(), argv.data());
+        ::_exit(127);
+    }
+
+    ::close(pipefd[1]);
+
+    {
+        std::lock_guard<std::mutex> lock(mFrameMutex);
+        mPendingFrame.release();
+        mHasNewFrame = false;
+        mReaderEnded = false;
+    }
+
+    mStopping.store(false);
+    mCameraPid       = pid;
+    mPipeFd          = pipefd[0];
+    mUsingRpicamPipe = true;
+
+    std::cout << "[Image_Processor] Iniciando captura via " << exePath << "...\n";
+    mReaderThread = std::thread(&Image_Processor::reader_loop, this);
+
+    // Aguarda o primeiro frame para garantir que a câmera está realmente entregando imagens
+    std::unique_lock<std::mutex> lock(mFrameMutex);
+    const bool ready = mFrameCv.wait_for(
+        lock, std::chrono::seconds(5),
+        [this]() { return mHasNewFrame || mReaderEnded; });
+
+    if (!ready || !mHasNewFrame) {
+        lock.unlock();
+        std::cerr << "[Image_Processor] Timeout ou falha ao receber primeiro frame de "
+                  << exePath << ".\n";
+        stop_rpicam_pipe();
+        return false;
+    }
+
+    return true;
+}
+
+void Image_Processor::stop_rpicam_pipe()
+{
+    mStopping.store(true);
+    mFrameCv.notify_all();
+
+    if (mCameraPid > 0) {
+        ::kill(mCameraPid, SIGTERM);
+        int status = 0;
+        bool reaped = false;
+        for (int i = 0; i < 50; ++i) {
+            const pid_t res = ::waitpid(mCameraPid, &status, WNOHANG);
+            if (res == mCameraPid || res < 0) {
+                reaped = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        if (!reaped) {
+            ::kill(mCameraPid, SIGKILL);
+            ::waitpid(mCameraPid, &status, 0);
+        }
+        mCameraPid = -1;
+    }
+
+    if (mReaderThread.joinable()) {
+        mReaderThread.join();
+    }
+
+    if (mPipeFd >= 0) {
+        ::close(mPipeFd);
+        mPipeFd = -1;
+    }
+
+    mUsingRpicamPipe = false;
+}
+
+void Image_Processor::reader_loop()
+{
+    const std::size_t frameBytes =
+        static_cast<std::size_t>(mParams.imageWidth) *
+        static_cast<std::size_t>(mParams.imageHeight) * 3u / 2u;
+
+    std::vector<unsigned char> buffer(frameBytes);
+
+    while (!mStopping.load()) {
+        if (!read_exact(mPipeFd, buffer.data(), frameBytes)) {
+            break;
+        }
+
+        cv::Mat yuv(mParams.imageHeight + mParams.imageHeight / 2,
+                    mParams.imageWidth, CV_8UC1, buffer.data());
+        cv::Mat bgr;
+        cv::cvtColor(yuv, bgr, cv::COLOR_YUV2BGR_I420);
+
+        {
+            std::lock_guard<std::mutex> lock(mFrameMutex);
+            mPendingFrame     = std::move(bgr);
+            mPendingTimestamp = std::chrono::steady_clock::now();
+            mHasNewFrame      = true;
+        }
+        mFrameCv.notify_one();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mFrameMutex);
+        mReaderEnded = true;
+    }
+    mFrameCv.notify_all();
+}
 
 std::string Image_Processor::build_pipeline() const
 {

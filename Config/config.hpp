@@ -32,6 +32,10 @@ inline constexpr int IMAGE_HEIGHT = 480;
 /// Taxa de quadros desejada (fps). Impacta a latência do loop de controle.
 inline constexpr double CAMERA_FPS = 30.0;
 
+/// Rotaciona a imagem da câmera em 180° (true se a câmera estiver de cabeça para baixo).
+/// No rpicam-vid/libcamera-vid a rotação é feita via hardware (--rotation 180).
+inline constexpr bool CAMERA_ROTATE_180 = true;
+
 /// Pipeline GStreamer para captura via libcamera (RPi OS Bookworm).
 /// Parâmetros width/height/framerate são substituídos em tempo de execução
 /// com base em IMAGE_WIDTH, IMAGE_HEIGHT e CAMERA_FPS.
@@ -49,7 +53,7 @@ inline constexpr int BLUR_KERNEL_SIZE = 5;
 
 // Faixa HSV primária (laranja-vermelho): H ∈ [0, 25]
 inline constexpr int HSV1_H_LOW  =   0;
-inline constexpr int HSV1_H_HIGH =  25;
+inline constexpr int HSV1_H_HIGH =  10;
 inline constexpr int HSV1_S_LOW  = 100;
 inline constexpr int HSV1_S_HIGH = 255;
 inline constexpr int HSV1_V_LOW  = 100;
@@ -83,7 +87,12 @@ inline constexpr double MAX_MEASUREMENT_AGE_S = 0.2;
 /// Período de amostragem do loop de controle em segundos (Ts).
 /// Deve ser maior que o tempo típico de processamento de imagem.
 /// Valor inicial: 50 ms → 20 Hz.
-inline constexpr double SAMPLE_PERIOD_S = 0.05;
+inline constexpr double SAMPLE_PERIOD_S = 0.2;
+
+/// Divisor de taxa para atualização da interface gráfica no pantilt.
+/// 1 = atualiza em todo ciclo (20 Hz); 2 = atualiza a cada 2 ciclos (10 Hz).
+/// O PID e o gráfico de erro continuam amostrando em todos os ciclos (20 Hz).
+inline constexpr int GUI_UPDATE_DIVIDER = 2;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CONTROLADOR PID — EIXO X (PAN)
@@ -92,17 +101,17 @@ inline constexpr double SAMPLE_PERIOD_S = 0.05;
 /// funcional. Devem ser calibrados experimentalmente antes da operação real.
 
 inline constexpr double PID_X_KP   = 0.001;   ///< Ganho proporcional [ms/px]
-inline constexpr double PID_X_KI   = 0.0001;  ///< Ganho integral     [ms/(px·s)]
-inline constexpr double PID_X_KD   = 0.0005;  ///< Ganho derivativo   [ms·s/px]
+inline constexpr double PID_X_KI   = 0.001;  ///< Ganho integral     [ms/(px·s)]
+inline constexpr double PID_X_KD   = 0.000;  ///< Ganho derivativo   [ms·s/px]
 
 /// Largura de pulso de referência (polarização) para o eixo pan [ms].
-inline constexpr double PID_X_BIAS_MS  = 1.5;
+inline constexpr double PID_X_BIAS_MS  = 1.540;
 
 /// Limites da saída em ms (pulso mínimo e máximo para o servo pan).
 /// Range conservador para manter o monitor sempre no campo de visão.
 /// Ajuste conforme o alcance físico necessário (use calibrate_servo para medir).
-inline constexpr double PID_X_OUT_MIN_MS = 1.2;
-inline constexpr double PID_X_OUT_MAX_MS = 1.8;
+inline constexpr double PID_X_OUT_MIN_MS = 1.4;
+inline constexpr double PID_X_OUT_MAX_MS = 1.680;
 /// Limite do acumulador integral (anti-windup por clamping).
 inline constexpr double PID_X_INT_LIMIT_MS = 0.4;
 
@@ -115,19 +124,19 @@ inline constexpr bool PID_X_INVERT = false;
 /// ATENÇÃO: Ganhos PROVISÓRIOS — calibrar experimentalmente.
 
 inline constexpr double PID_Y_KP   = 0.001;
-inline constexpr double PID_Y_KI   = 0.0001;
-inline constexpr double PID_Y_KD   = 0.0005;
+inline constexpr double PID_Y_KI   = 0.001;
+inline constexpr double PID_Y_KD   = 0.000;
 
 /// Largura de pulso de referência para o eixo tilt [ms].
 /// ATENÇÃO: ajuste este valor até a câmera apontar horizontalmente (para frente).
 /// Se o servo vai para baixo em 1.5 ms, tente valores menores (ex: 1.0, 1.2).
-inline constexpr double PID_Y_BIAS_MS  = 1.5;
+inline constexpr double PID_Y_BIAS_MS  = 1.3;
 
 /// Limites da saída em ms.
 /// Range conservador para manter o monitor sempre no campo de visão.
 /// Ajuste conforme o alcance físico necessário (use calibrate_servo para medir).
-inline constexpr double PID_Y_OUT_MIN_MS = 1.2;
-inline constexpr double PID_Y_OUT_MAX_MS = 1.8;
+inline constexpr double PID_Y_OUT_MIN_MS = 1.190;
+inline constexpr double PID_Y_OUT_MAX_MS = 1.480;
 
 /// Limite do acumulador integral (anti-windup por clamping).
 inline constexpr double PID_Y_INT_LIMIT_MS = 0.4;
@@ -162,9 +171,13 @@ inline constexpr unsigned int LASER_GPIO = 26;
 /// 50 Hz é o padrão para servos analógicos como o MG90S (período = 20 ms).
 inline constexpr unsigned int SERVO_PWM_FREQ_HZ = 50;
 
-/// Largura de pulso segura aplicada ao encerrar o sistema [ms].
-/// Deve corresponder ao mesmo valor de PID_Y_BIAS_MS (câmera apontando para frente).
-inline constexpr double SERVO_SAFE_PULSE_MS = 1.5;
+/// Largura de pulso segura aplicada ao servo pan ao iniciar e encerrar [ms].
+/// Corresponde ao mesmo valor de PID_X_BIAS_MS (posição central).
+inline constexpr double SERVO_PAN_SAFE_PULSE_MS = PID_X_BIAS_MS;
+
+/// Largura de pulso segura aplicada ao servo tilt ao iniciar e encerrar [ms].
+/// Corresponde ao mesmo valor de PID_Y_BIAS_MS (câmera apontando para o centro).
+inline constexpr double SERVO_TILT_SAFE_PULSE_MS = PID_Y_BIAS_MS;
 
 /// Largura de pulso mínima absoluta permitida pelo hardware [ms].
 /// Protege o servo contra comandos fora de especificação.
