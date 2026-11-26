@@ -87,7 +87,7 @@ inline constexpr double MAX_MEASUREMENT_AGE_S = 0.2;
 /// Período de amostragem do loop de controle em segundos (Ts).
 /// Deve ser maior que o tempo típico de processamento de imagem.
 /// Valor inicial: 50 ms → 20 Hz.
-inline constexpr double SAMPLE_PERIOD_S = 0.1;
+inline constexpr double SAMPLE_PERIOD_S = 0.2;
 
 /// Divisor de taxa para atualização da interface gráfica no pantilt.
 /// 1 = atualiza em todo ciclo (20 Hz); 2 = atualiza a cada 2 ciclos (10 Hz).
