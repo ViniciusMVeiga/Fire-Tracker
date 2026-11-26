@@ -4,6 +4,9 @@
 *.exe
 *.out
 
+# Ambientes 
+.venv 
+
 # Executáveis do projeto
 pantilt
 pantilt_mock
