@@ -34,15 +34,15 @@ namespace Image_Processing {
 struct Control_Panel_State {
     bool   running = false;  ///< true → sistema em execução; false → parado/editável
 
-    // Ganhos PID eixo X (Pan)
-    double kpX = 0.001;
-    double kiX = 0.0001;
-    double kdX = 0.0005;
+    // Ganhos PID eixo X (Pan). Preenchidos por main() a partir de Config.
+    double kpX = 0.0;
+    double kiX = 0.0;
+    double kdX = 0.0;
 
-    // Ganhos PID eixo Y (Tilt)
-    double kpY = 0.001;
-    double kiY = 0.0001;
-    double kdY = 0.0005;
+    // Ganhos PID eixo Y (Tilt). Preenchidos por main() a partir de Config.
+    double kpY = 0.0;
+    double kiY = 0.0;
+    double kdY = 0.0;
 
     /// Região (em coordenadas do canvas do dashboard) do botão Start/Stop.
     /// Preenchida pelo Dashboard_Renderer durante render() — usada pelo mouse callback.
@@ -298,6 +298,9 @@ public:
                           bool validMeas,
                           Control_Panel_State& ctrlState)
     {
+        // A miniatura da máscara HSV foi substituída pelo painel de controle.
+        (void)maskFrame;
+
         constexpr int kPanelWidth  = 440;
         constexpr int kPlotHeight  = 300;
         constexpr int kControlH    = 180;  ///< altura do painel Start/Stop + ganhos

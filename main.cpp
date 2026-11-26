@@ -58,6 +58,10 @@ static std::atomic<bool> gRunning{true};
 /// Estado do painel de controle (Start/Stop + ganhos PID editáveis).
 static Image_Processing::Control_Panel_State gCtrl;
 
+/// Ponteiros para os PIDs, usados para aplicar os ganhos editados na GUI.
+static Control::Pid_Controller* gPidX = nullptr;
+static Control::Pid_Controller* gPidY = nullptr;
+
 static void signal_handler(int signal)
 {
     std::cout << "\n[main] Sinal " << signal
@@ -77,17 +81,82 @@ static constexpr double kGainDivide = static_cast<double>(kGainScale);
 static int gTbKpX = 0, gTbKiX = 0, gTbKdX = 0;
 static int gTbKpY = 0, gTbKiY = 0, gTbKdY = 0;
 
+/// Indica se as trackbars foram criadas (só existe GUI com display).
+static bool gTrackbarsReady = false;
+
 static const char* kGainWin = "Ganhos PID (editar quando parado)";
+
+/// Inicializa gCtrl com os ganhos atuais definidos em Config.
+static void init_ctrl_from_config()
+{
+    gCtrl.kpX = Config::PID_X_KP;
+    gCtrl.kiX = Config::PID_X_KI;
+    gCtrl.kdX = Config::PID_X_KD;
+    gCtrl.kpY = Config::PID_Y_KP;
+    gCtrl.kiY = Config::PID_Y_KI;
+    gCtrl.kdY = Config::PID_Y_KD;
+    gCtrl.running = false;
+}
 
 /// Lê os trackbars e atualiza gCtrl (chamado antes de iniciar o controle).
 static void apply_trackbars_to_ctrl()
 {
+    if (!gTrackbarsReady) {
+        return;
+    }
     gCtrl.kpX = gTbKpX / kGainDivide;
     gCtrl.kiX = gTbKiX / kGainDivide;
     gCtrl.kdX = gTbKdX / kGainDivide;
     gCtrl.kpY = gTbKpY / kGainDivide;
     gCtrl.kiY = gTbKiY / kGainDivide;
     gCtrl.kdY = gTbKdY / kGainDivide;
+}
+
+/// Copia os ganhos de gCtrl para os PIDs, preservando bias/limites/Ts.
+static void apply_gains_to_pids()
+{
+    if (gPidX != nullptr) {
+        Control::Pid_Params p = gPidX->get_params();
+        p.kp = gCtrl.kpX;
+        p.ki = gCtrl.kiX;
+        p.kd = gCtrl.kdX;
+        gPidX->set_params(p);
+        gPidX->reset();
+    }
+    if (gPidY != nullptr) {
+        Control::Pid_Params p = gPidY->get_params();
+        p.kp = gCtrl.kpY;
+        p.ki = gCtrl.kiY;
+        p.kd = gCtrl.kdY;
+        gPidY->set_params(p);
+        gPidY->reset();
+    }
+}
+
+/// Liga/desliga o controle (botão do dashboard ou tecla S).
+static void set_running(bool run, const char* source)
+{
+    if (run == gCtrl.running) {
+        return;
+    }
+
+    if (run) {
+        // Ao iniciar, os valores editados nas trackbars passam a valer.
+        apply_trackbars_to_ctrl();
+        apply_gains_to_pids();
+    } else {
+        // Ao parar, zera integradores/derivativo para não retomar com estado velho.
+        if (gPidX != nullptr) gPidX->reset();
+        if (gPidY != nullptr) gPidY->reset();
+    }
+
+    gCtrl.running = run;
+    std::cout << "[main] Sistema " << (run ? "INICIADO" : "PARADO")
+              << " (" << source << "). Ganhos: "
+              << "KpX=" << gCtrl.kpX << " KiX=" << gCtrl.kiX
+              << " KdX=" << gCtrl.kdX
+              << " | KpY=" << gCtrl.kpY << " KiY=" << gCtrl.kiY
+              << " KdY=" << gCtrl.kdY << "\n";
 }
 
 /// Inicializa trackbars a partir dos valores iniciais de gCtrl.
@@ -107,6 +176,8 @@ static void init_trackbars()
     cv::createTrackbar("Kp_Y (x1e-5)", kGainWin, &gTbKpY, kGainMax, nullptr);
     cv::createTrackbar("Ki_Y (x1e-5)", kGainWin, &gTbKiY, kGainMax, nullptr);
     cv::createTrackbar("Kd_Y (x1e-5)", kGainWin, &gTbKdY, kGainMax, nullptr);
+
+    gTrackbarsReady = true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -119,12 +190,7 @@ static void on_mouse(int event, int x, int y, int /*flags*/, void* /*userdata*/)
         return;
     }
     if (gCtrl.buttonRect.contains(cv::Point(x, y))) {
-        if (!gCtrl.running) {
-            apply_trackbars_to_ctrl();
-        }
-        gCtrl.running = !gCtrl.running;
-        std::cout << "[main] Sistema " << (gCtrl.running ? "INICIADO" : "PARADO")
-                  << " pelo botão.\n";
+        set_running(!gCtrl.running, "botão");
     }
 }
 
@@ -277,6 +343,8 @@ int main()
     // ── 4. Inicializa os controladores PID e visualização ────────────────────
     Control::Pid_Controller pidX(build_pid_x_params());
     Control::Pid_Controller pidY(build_pid_y_params());
+    gPidX = &pidX;
+    gPidY = &pidY;
 
     const bool guiEnabled = (std::getenv("DISPLAY") != nullptr ||
                              std::getenv("WAYLAND_DISPLAY") != nullptr);
@@ -284,11 +352,23 @@ int main()
     Image_Processing::Pid_Error_Plot errorPlot(xRef, yRef, 160);
     Image_Processing::Dashboard_Renderer dashboard;
 
+    // Estado inicial do painel: ganhos vindos de Config (não de valores fixos).
+    init_ctrl_from_config();
+
     if (guiEnabled) {
         cv::namedWindow("Pan-Tilt PID", cv::WINDOW_AUTOSIZE);
+        cv::setMouseCallback("Pan-Tilt PID", on_mouse, nullptr);
+        init_trackbars();
+        std::cout << "[main] Interface gráfica ativa. Use o botão ou a tecla S "
+                     "para iniciar/parar.\n";
     } else {
+        // Sem display não há como acionar o botão: mantém o comportamento
+        // anterior e inicia o controle imediatamente.
+        gCtrl.running = true;
         std::cout << "[main] Aviso: DISPLAY/WAYLAND_DISPLAY ausente; "
-                     "janelas visuais desativadas.\n";
+                     "janelas visuais desativadas (controle iniciado).\n"
+                  << "[main] Dica: se estiver usando sudo no Wayland, rode "
+                     "'sudo -E ./pantilt' para preservar o ambiente gráfico.\n";
     }
 
     // ── 5. Loop de controle ──────────────────────────────────────────────────
@@ -302,7 +382,10 @@ int main()
     long cycleCount   = 0L;
     long missCount    = 0L;  ///< Ciclos com processamento mais lento que Ts
 
-    std::cout << "[main] Loop de controle iniciado. CTRL+C para encerrar.\n";
+    std::cout << "[main] Loop principal iniciado. CTRL+C para encerrar.\n";
+    if (!gCtrl.running) {
+        std::cout << "[main] Controle PARADO. Use o botão INICIAR ou a tecla S.\n";
+    }
 
     while (gRunning.load()) {
         const auto cycleStart = Clock::now();
@@ -317,7 +400,20 @@ int main()
 
         bool validMeas = meas.valid && (age <= maxMeasAge);
 
-        if (!meas.valid) {
+        std::optional<double> plotErrorX;
+        std::optional<double> plotErrorY;
+        double panMs  = servoDriver.get_pan_pulse_ms();
+        double tiltMs = servoDriver.get_tilt_pulse_ms();
+        bool panSat   = false;
+        bool tiltSat  = false;
+
+        if (!gCtrl.running) {
+            // Sistema parado: mantém os servos na posição atual, desliga o
+            // laser e deixa as trackbars editarem os ganhos ao vivo.
+            apply_trackbars_to_ctrl();
+            laserDriver.turn_off();
+            validMeas = false;
+        } else if (!meas.valid) {
             // Alvo não detectado: mantém servos na posição atual (sem novo comando)
             if (cycleCount % 30 == 0) {
                 std::cout << "[main] Ciclo " << cycleCount
@@ -335,15 +431,8 @@ int main()
             validMeas = false;
         }
 
-        std::optional<double> plotErrorX;
-        std::optional<double> plotErrorY;
-        double panMs  = servoDriver.get_pan_pulse_ms();
-        double tiltMs = servoDriver.get_tilt_pulse_ms();
-        bool panSat   = false;
-        bool tiltSat  = false;
-
         // ── 5c. Calcula e envia comandos somente com medição válida ──────────
-        if (validMeas) {
+        if (gCtrl.running && validMeas) {
             // Liga o laser ao detectar o alvo
             laserDriver.turn_on();
 
@@ -384,7 +473,7 @@ int main()
             }
         }
 
-        // ── 5e2. Atualiza janela única (câmera, máscara e gráfico de erro)
+        // ── 5e2. Atualiza janela única (câmera, gráfico e painel de controle)
         if (guiEnabled) {
             errorPlot.push_sample(plotErrorX, plotErrorY);
 
@@ -395,7 +484,8 @@ int main()
                     const std::string statusLine =
                         "Pan: " + Image_Processing::format_decimal(panMs) +
                         " ms | Tilt: " + Image_Processing::format_decimal(tiltMs) +
-                        " ms | Laser: " + (validMeas ? "ON" : "OFF");
+                        " ms | Laser: " +
+                        ((gCtrl.running && validMeas) ? "ON" : "OFF");
 
                     const cv::Mat& dashImg = dashboard.render(
                         lastFrame,
@@ -408,16 +498,22 @@ int main()
                         tiltMs,
                         panSat,
                         tiltSat,
-                        validMeas);
+                        validMeas,
+                        gCtrl);
 
                     cv::imshow("Pan-Tilt PID", dashImg);
                 }
+            }
 
-                const int rawKey = cv::waitKey(1);
-                if (rawKey == 27 ||
-                    (rawKey >= 0 &&
-                     std::tolower(static_cast<unsigned char>(rawKey & 0xFF)) == 'q')) {
+            // Processa eventos da GUI em todo ciclo (resposta mais rápida).
+            const int rawKey = cv::waitKey(1);
+            if (rawKey >= 0) {
+                const int key = std::tolower(
+                    static_cast<unsigned char>(rawKey & 0xFF));
+                if (key == 27 || key == 'q') {
                     gRunning.store(false);
+                } else if (key == 's') {
+                    set_running(!gCtrl.running, "tecla S");
                 }
             }
         }

@@ -37,6 +37,15 @@ SRCS := main.cpp \
         Actuators/Servo_Driver.cpp \
         Actuators/Laser_Driver.cpp
 
+# Headers comuns: incluí-los como dependência garante rebuild quando
+# configurações ou a GUI mudarem (evita executar um binário desatualizado).
+HDRS := Config/config.hpp \
+        Image_Processing/Image_Processor.hpp \
+        Image_Processing/Camera_Display.hpp \
+        Control/Pid_Controller.hpp \
+        Actuators/Servo_Driver.hpp \
+        Actuators/Laser_Driver.hpp
+
 TARGET := pantilt
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -51,8 +60,8 @@ all: $(TARGET) calibrate_servo view_camera
 	@echo "  sudo ./view_camera                      # câmera + calibração interativa"
 	@echo "=================================================="
 
-$(TARGET): $(SRCS)
-	$(CXX) $(CXXFLAGS) $(OPENCV_CFLAGS) -I. $^ -o $@ \
+$(TARGET): $(SRCS) $(HDRS)
+	$(CXX) $(CXXFLAGS) $(OPENCV_CFLAGS) -I. $(SRCS) -o $@ \
 		$(OPENCV_LIBS) $(PIGPIO_LIBS)
 	@echo "Compilado: $(TARGET) (execute com: sudo ./$(TARGET))"
 
@@ -60,8 +69,8 @@ $(TARGET): $(SRCS)
 # Modo mock (sem hardware GPIO nem câmera RPi)
 # Compila com -DHARDWARE_MOCK para ativar stubs pigpio e câmera USB.
 # ─────────────────────────────────────────────────────────────────────────────
-mock: $(SRCS)
-	$(CXX) $(CXXFLAGS) $(OPENCV_CFLAGS) -DHARDWARE_MOCK -I. $^ -o $(TARGET)_mock \
+mock: $(SRCS) $(HDRS)
+	$(CXX) $(CXXFLAGS) $(OPENCV_CFLAGS) -DHARDWARE_MOCK -I. $(SRCS) -o $(TARGET)_mock \
 		$(OPENCV_LIBS) -lpthread
 	@echo "Compilado: $(TARGET)_mock  (modo mock — sem pigpio, sem câmera RPi)"
 	@echo "Execute com: ./$(TARGET)_mock"
@@ -85,11 +94,11 @@ tests: $(TEST_PID_BIN) $(TEST_SERVO_BIN)
 	@echo "─── Executando: test_servo_mock ───"
 	./$(TEST_SERVO_BIN)
 
-$(TEST_PID_BIN): $(TEST_PID_SRCS)
-	$(CXX) $(CXXFLAGS) -DHARDWARE_MOCK -I. $^ -o $@
+$(TEST_PID_BIN): $(TEST_PID_SRCS) Control/Pid_Controller.hpp
+	$(CXX) $(CXXFLAGS) -DHARDWARE_MOCK -I. $(TEST_PID_SRCS) -o $@
 
-$(TEST_SERVO_BIN): $(TEST_SERVO_SRCS)
-	$(CXX) $(CXXFLAGS) -DHARDWARE_MOCK -I. $^ -o $@
+$(TEST_SERVO_BIN): $(TEST_SERVO_SRCS) Actuators/Servo_Driver.hpp
+	$(CXX) $(CXXFLAGS) -DHARDWARE_MOCK -I. $(TEST_SERVO_SRCS) -o $@
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Ferramentas auxiliares
@@ -102,8 +111,8 @@ calibrate_servo: tools/calibrate_servo.cpp
 	$(CXX) $(CXXFLAGS) -I. $< -o $@ $(PIGPIO_LIBS)
 	@echo "Compilado: calibrate_servo (execute com: sudo ./calibrate_servo <gpio> <pulso_ms>)"
 
-view_camera: $(VIEW_CAMERA_SRCS)
-	$(CXX) $(CXXFLAGS) $(OPENCV_CFLAGS) -I. $^ -o $@ \
+view_camera: $(VIEW_CAMERA_SRCS) $(HDRS)
+	$(CXX) $(CXXFLAGS) $(OPENCV_CFLAGS) -I. $(VIEW_CAMERA_SRCS) -o $@ \
 		$(OPENCV_LIBS) $(PIGPIO_LIBS)
 	@echo "Compilado: view_camera (execute com: sudo ./view_camera)"
 
