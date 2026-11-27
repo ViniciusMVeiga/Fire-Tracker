@@ -8,7 +8,8 @@
  *   3. Control::Pid_Controller (eixo Y)   — controlador PID tilt
  *   4. Actuators::Servo_Driver            — acionamento dos servos via pigpio
  *
- * Fluxo do loop de controle (período Ts = Config::SAMPLE_PERIOD_S):
+ * Fluxo do loop de controle (período Ts = Config::SAMPLE_PERIOD_S, ajustável
+ * em tempo de execução pela janela de configurações quando o sistema está parado):
  *   1. Captura frame e executa pipeline de detecção
  *   2. Verifica validade e atualidade da medição
  *   3. Calcula erros: error_x = x_ref - x, error_y = y_ref - y
@@ -30,12 +31,17 @@
 #include "Config/config.hpp"
 #include "Image_Processing/Image_Processor.hpp"
 #include "Image_Processing/Camera_Display.hpp"
+#include "Image_Processing/Pid_Params_Editor.hpp"
+#include "Image_Processing/Error_Log.hpp"
 #include "Control/Pid_Controller.hpp"
 #include "Actuators/Servo_Driver.hpp"
 #include "Actuators/Laser_Driver.hpp"
 
 #include <algorithm>
 #include <iostream>
+#include <iomanip>
+#include <sstream>
+#include <ctime>
 #include <csignal>
 #include <cstdlib>
 #include <cctype>
@@ -46,6 +52,11 @@
 #include <stdexcept>
 #include <cmath>
 
+#include <sys/stat.h>  // mkdir da pasta logs/
+#ifdef _WIN32
+#  include <direct.h>  // _mkdir no Windows (apenas para validação local)
+#endif
+
 #include <opencv2/highgui.hpp>
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -55,12 +66,37 @@
 /// Flag atômica verificada no loop principal. Setada por SIGINT/SIGTERM.
 static std::atomic<bool> gRunning{true};
 
-/// Estado do painel de controle (Start/Stop + ganhos PID editáveis).
+/// Estado do painel de controle (Start/Stop + parâmetros PID editáveis).
 static Image_Processing::Control_Panel_State gCtrl;
 
-/// Ponteiros para os PIDs, usados para aplicar os ganhos editados na GUI.
+/// Ponteiros para os PIDs, usados para aplicar os parâmetros editados na GUI.
 static Control::Pid_Controller* gPidX = nullptr;
 static Control::Pid_Controller* gPidY = nullptr;
+
+/// Janela de configurações (campos de texto + botão de salvamento).
+static Image_Processing::Pid_Params_Editor gPidEditor;
+
+/// Log de erro da sessão atual (exportado em CSV sob demanda).
+static Image_Processing::Error_Log gErrorLog;
+
+/// Período de amostragem efetivo do loop [s]. Atualizado ao iniciar o controle.
+static double gSamplePeriodS = Config::SAMPLE_PERIOD_S;
+
+/// Dimensões efetivas do frame (preenchidas após abrir a câmera).
+static int gFrameWidth = 0;
+static int gFrameHeight = 0;
+
+/// Mira: deslocamento editado e referência efetivamente aplicada [px].
+/// (0,0) de deslocamento = centro da imagem; X+ à direita, Y+ para baixo.
+static double gAimOffsetX = Config::AIM_OFFSET_X_PX;
+static double gAimOffsetY = Config::AIM_OFFSET_Y_PX;
+static double gRefX = 0.0;
+static double gRefY = 0.0;
+
+/// Marcações da sessão de log.
+using Clock = std::chrono::steady_clock;
+static Clock::time_point gSessionStart;
+static long gSessionSample = 0L;
 
 static void signal_handler(int signal)
 {
@@ -70,23 +106,12 @@ static void signal_handler(int signal)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Trackbars de ganhos PID — escala: valor_real = trackbar / 100000.0
+// Janela de configurações — campos de texto e salvamento do CSV
 // ─────────────────────────────────────────────────────────────────────────────
 
-static constexpr int    kGainScale  = 100000;
-static constexpr int    kGainMax    = 10000;   ///< max trackbar = 0.10000
-static constexpr double kGainDivide = static_cast<double>(kGainScale);
+static const char* kParamsWin = Image_Processing::Pid_Params_Editor::window_name();
 
-/// Variáveis inteiras para os 6 trackbars (valor real = int / kGainScale).
-static int gTbKpX = 0, gTbKiX = 0, gTbKdX = 0;
-static int gTbKpY = 0, gTbKiY = 0, gTbKdY = 0;
-
-/// Indica se as trackbars foram criadas (só existe GUI com display).
-static bool gTrackbarsReady = false;
-
-static const char* kGainWin = "Ganhos PID (editar quando parado)";
-
-/// Inicializa gCtrl com os ganhos atuais definidos em Config.
+/// Inicializa gCtrl com os parâmetros atuais definidos em Config.
 static void init_ctrl_from_config()
 {
     gCtrl.kpX = Config::PID_X_KP;
@@ -95,31 +120,81 @@ static void init_ctrl_from_config()
     gCtrl.kpY = Config::PID_Y_KP;
     gCtrl.kiY = Config::PID_Y_KI;
     gCtrl.kdY = Config::PID_Y_KD;
+    gCtrl.samplePeriodMs = Config::SAMPLE_PERIOD_S * 1000.0;
+    gCtrl.aimOffsetX = Config::AIM_OFFSET_X_PX;
+    gCtrl.aimOffsetY = Config::AIM_OFFSET_Y_PX;
     gCtrl.running = false;
 }
 
-/// Lê os trackbars e atualiza gCtrl (chamado antes de iniciar o controle).
-static void apply_trackbars_to_ctrl()
+/// Callback de mouse da janela de configurações.
+static void on_params_mouse(int event, int x, int y, int /*flags*/,
+                            void* /*userdata*/)
 {
-    if (!gTrackbarsReady) {
-        return;
-    }
-    gCtrl.kpX = gTbKpX / kGainDivide;
-    gCtrl.kiX = gTbKiX / kGainDivide;
-    gCtrl.kdX = gTbKdX / kGainDivide;
-    gCtrl.kpY = gTbKpY / kGainDivide;
-    gCtrl.kiY = gTbKiY / kGainDivide;
-    gCtrl.kdY = gTbKdY / kGainDivide;
+    gPidEditor.handle_mouse(event, x, y);
 }
 
-/// Copia os ganhos de gCtrl para os PIDs, preservando bias/limites/Ts.
-static void apply_gains_to_pids()
+/// Cria a janela de configurações com os valores iniciais de Config.
+static void init_params_editor(int frameWidth, int frameHeight)
 {
+    Image_Processing::Pid_Editor_Values values;
+    values.kpX            = Config::PID_X_KP;
+    values.kiX            = Config::PID_X_KI;
+    values.kdX            = Config::PID_X_KD;
+    values.kpY            = Config::PID_Y_KP;
+    values.kiY            = Config::PID_Y_KI;
+    values.kdY            = Config::PID_Y_KD;
+    values.samplePeriodMs = Config::SAMPLE_PERIOD_S * 1000.0;
+    values.aimOffsetX     = Config::AIM_OFFSET_X_PX;
+    values.aimOffsetY     = Config::AIM_OFFSET_Y_PX;
+
+    gPidEditor.set_frame_size(frameWidth, frameHeight);
+    gPidEditor.set_values(values);
+    cv::namedWindow(kParamsWin, cv::WINDOW_AUTOSIZE);
+    cv::setMouseCallback(kParamsWin, on_params_mouse, nullptr);
+}
+
+/// Copia os valores confirmados no editor para gCtrl.
+static void apply_editor_to_ctrl()
+{
+    const Image_Processing::Pid_Editor_Values values = gPidEditor.values();
+    gCtrl.kpX            = values.kpX;
+    gCtrl.kiX            = values.kiX;
+    gCtrl.kdX            = values.kdX;
+    gCtrl.kpY            = values.kpY;
+    gCtrl.kiY            = values.kiY;
+    gCtrl.kdY            = values.kdY;
+    gCtrl.samplePeriodMs = values.samplePeriodMs;
+
+    // A mira é sempre refletida na pré-visualização; só vira referência do
+    // controle quando o sistema é iniciado (ver set_running).
+    gAimOffsetX = values.aimOffsetX;
+    gAimOffsetY = values.aimOffsetY;
+    gCtrl.aimOffsetX = values.aimOffsetX;
+    gCtrl.aimOffsetY = values.aimOffsetY;
+}
+
+/// Reflete no dashboard a mira já confirmada no editor (também quando parado).
+static void sync_aim_preview()
+{
+    const Image_Processing::Pid_Editor_Values values = gPidEditor.values();
+    gAimOffsetX = values.aimOffsetX;
+    gAimOffsetY = values.aimOffsetY;
+    gCtrl.aimOffsetX = gAimOffsetX;
+    gCtrl.aimOffsetY = gAimOffsetY;
+}
+
+/// Copia ganhos e período de amostragem de gCtrl para os PIDs.
+/// Preserva bias e limites de saída; reinicia o estado interno.
+static void apply_params_to_pids()
+{
+    const double ts = gCtrl.samplePeriodMs / 1000.0;
+
     if (gPidX != nullptr) {
         Control::Pid_Params p = gPidX->get_params();
         p.kp = gCtrl.kpX;
         p.ki = gCtrl.kiX;
         p.kd = gCtrl.kdX;
+        p.samplePeriodS = ts;
         gPidX->set_params(p);
         gPidX->reset();
     }
@@ -128,6 +203,7 @@ static void apply_gains_to_pids()
         p.kp = gCtrl.kpY;
         p.ki = gCtrl.kiY;
         p.kd = gCtrl.kdY;
+        p.samplePeriodS = ts;
         gPidY->set_params(p);
         gPidY->reset();
     }
@@ -141,9 +217,17 @@ static void set_running(bool run, const char* source)
     }
 
     if (run) {
-        // Ao iniciar, os valores editados nas trackbars passam a valer.
-        apply_trackbars_to_ctrl();
-        apply_gains_to_pids();
+        // Ao iniciar, os valores editados na janela de configurações passam a valer.
+        apply_editor_to_ctrl();
+        apply_params_to_pids();
+        gSamplePeriodS = gCtrl.samplePeriodMs / 1000.0;
+
+        // Aplica a mira em relação ao centro do frame e inicia nova sessão de log.
+        gRefX = static_cast<double>(gFrameWidth) / 2.0 + gAimOffsetX;
+        gRefY = static_cast<double>(gFrameHeight) / 2.0 + gAimOffsetY;
+        gErrorLog.clear();
+        gSessionSample = 0L;
+        gSessionStart = Clock::now();
     } else {
         // Ao parar, zera integradores/derivativo para não retomar com estado velho.
         if (gPidX != nullptr) gPidX->reset();
@@ -151,33 +235,61 @@ static void set_running(bool run, const char* source)
     }
 
     gCtrl.running = run;
+    gPidEditor.set_enabled(!run);
+
     std::cout << "[main] Sistema " << (run ? "INICIADO" : "PARADO")
               << " (" << source << "). Ganhos: "
               << "KpX=" << gCtrl.kpX << " KiX=" << gCtrl.kiX
               << " KdX=" << gCtrl.kdX
               << " | KpY=" << gCtrl.kpY << " KiY=" << gCtrl.kiY
-              << " KdY=" << gCtrl.kdY << "\n";
+              << " KdY=" << gCtrl.kdY
+              << " | Ts=" << gCtrl.samplePeriodMs << " ms"
+              << " | Mira=(" << gAimOffsetX << "," << gAimOffsetY << ") px\n";
 }
 
-/// Inicializa trackbars a partir dos valores iniciais de gCtrl.
-static void init_trackbars()
+/// Data/hora atual formatada para compor o nome do arquivo CSV.
+static std::string make_timestamp()
 {
-    gTbKpX = static_cast<int>(gCtrl.kpX * kGainDivide + 0.5);
-    gTbKiX = static_cast<int>(gCtrl.kiX * kGainDivide + 0.5);
-    gTbKdX = static_cast<int>(gCtrl.kdX * kGainDivide + 0.5);
-    gTbKpY = static_cast<int>(gCtrl.kpY * kGainDivide + 0.5);
-    gTbKiY = static_cast<int>(gCtrl.kiY * kGainDivide + 0.5);
-    gTbKdY = static_cast<int>(gCtrl.kdY * kGainDivide + 0.5);
+    const std::time_t now = std::chrono::system_clock::to_time_t(
+        std::chrono::system_clock::now());
+    std::ostringstream oss;
+    oss << std::put_time(std::localtime(&now), "%Y-%m-%d_%H-%M-%S");
+    return oss.str();
+}
 
-    cv::namedWindow(kGainWin, cv::WINDOW_AUTOSIZE);
-    cv::createTrackbar("Kp_X (x1e-5)", kGainWin, &gTbKpX, kGainMax, nullptr);
-    cv::createTrackbar("Ki_X (x1e-5)", kGainWin, &gTbKiX, kGainMax, nullptr);
-    cv::createTrackbar("Kd_X (x1e-5)", kGainWin, &gTbKdX, kGainMax, nullptr);
-    cv::createTrackbar("Kp_Y (x1e-5)", kGainWin, &gTbKpY, kGainMax, nullptr);
-    cv::createTrackbar("Ki_Y (x1e-5)", kGainWin, &gTbKiY, kGainMax, nullptr);
-    cv::createTrackbar("Kd_Y (x1e-5)", kGainWin, &gTbKdY, kGainMax, nullptr);
+/// Grava a sessão atual em logs/pid_AAAA-MM-DD_HH-MM-SS.csv.
+static void save_csv_now()
+{
+    const std::string stamp = make_timestamp();
+    const std::string dir   = "logs";
+#ifdef _WIN32
+    ::_mkdir(dir.c_str());  // ignorado se a pasta já existir
+#else
+    ::mkdir(dir.c_str(), 0755);  // ignorado se a pasta já existir
+#endif
+    const std::string path = dir + "/pid_" + stamp + ".csv";
 
-    gTrackbarsReady = true;
+    Image_Processing::Error_Log_Metadata meta;
+    meta.timestamp      = stamp;
+    meta.frameWidth     = gFrameWidth;
+    meta.frameHeight    = gFrameHeight;
+    meta.kpX = gCtrl.kpX; meta.kiX = gCtrl.kiX; meta.kdX = gCtrl.kdX;
+    meta.kpY = gCtrl.kpY; meta.kiY = gCtrl.kiY; meta.kdY = gCtrl.kdY;
+    meta.samplePeriodMs = gCtrl.samplePeriodMs;
+    // Usa a mira efetivamente aplicada no último start (não a edição atual).
+    meta.aimOffsetX     = gRefX - static_cast<double>(gFrameWidth) / 2.0;
+    meta.aimOffsetY     = gRefY - static_cast<double>(gFrameHeight) / 2.0;
+    meta.invertX        = Config::PID_X_INVERT;
+    meta.invertY        = Config::PID_Y_INVERT;
+
+    if (gErrorLog.save_csv(path, meta)) {
+        std::cout << "[main] CSV salvo: " << path
+                  << " (" << gErrorLog.size() << " amostras)\n";
+        gPidEditor.show_status("CSV salvo: logs/pid_" + stamp + ".csv", true);
+    } else {
+        std::cerr << "[main] Falha ao salvar CSV em " << path << "\n";
+        gPidEditor.show_status("Falha ao salvar CSV", false);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -331,14 +443,19 @@ int main()
         return 1;
     }
 
-    // Referência = centro da imagem (nas dimensões efetivas do frame)
-    const double xRef = frameSize.width  / 2.0;
-    const double yRef = frameSize.height / 2.0;
+    // Referência inicial = centro do frame; a janela de configurações pode
+    // deslocá-la antes de iniciar (ver set_running).
+    gFrameWidth  = frameSize.width;
+    gFrameHeight = frameSize.height;
+    gRefX = static_cast<double>(gFrameWidth) / 2.0 + gAimOffsetX;
+    gRefY = static_cast<double>(gFrameHeight) / 2.0 + gAimOffsetY;
+    gSessionStart = Clock::now();
 
-    std::cout << "[main] Frame efetivo: " << frameSize.width
-              << "x" << frameSize.height << "\n"
-              << "[main] Referência: x_ref = " << xRef
-              << ", y_ref = " << yRef << "\n\n";
+    std::cout << "[main] Frame efetivo: " << gFrameWidth
+              << "x" << gFrameHeight << "\n"
+              << "[main] Referência inicial: x_ref = " << gRefX
+              << ", y_ref = " << gRefY
+              << " (mira = " << gAimOffsetX << "," << gAimOffsetY << " px)\n\n";
 
     // ── 4. Inicializa os controladores PID e visualização ────────────────────
     Control::Pid_Controller pidX(build_pid_x_params());
@@ -348,19 +465,19 @@ int main()
 
     const bool guiEnabled = (std::getenv("DISPLAY") != nullptr ||
                              std::getenv("WAYLAND_DISPLAY") != nullptr);
-    const cv::Point centerRef(static_cast<int>(xRef), static_cast<int>(yRef));
-    Image_Processing::Pid_Error_Plot errorPlot(xRef, yRef, 160);
+    Image_Processing::Pid_Error_Plot errorPlot(gRefX, gRefY, 160);
     Image_Processing::Dashboard_Renderer dashboard;
 
-    // Estado inicial do painel: ganhos vindos de Config (não de valores fixos).
+    // Estado inicial do painel: parâmetros vindos de Config (não de valores fixos).
     init_ctrl_from_config();
 
     if (guiEnabled) {
         cv::namedWindow("Pan-Tilt PID", cv::WINDOW_AUTOSIZE);
         cv::setMouseCallback("Pan-Tilt PID", on_mouse, nullptr);
-        init_trackbars();
+        init_params_editor(gFrameWidth, gFrameHeight);
         std::cout << "[main] Interface gráfica ativa. Use o botão ou a tecla S "
-                     "para iniciar/parar.\n";
+                     "para iniciar/parar. Edite ganhos, Ts e mira na janela "
+                     "de configurações com o sistema parado.\n";
     } else {
         // Sem display não há como acionar o botão: mantém o comportamento
         // anterior e inicia o controle imediatamente.
@@ -372,13 +489,8 @@ int main()
     }
 
     // ── 5. Loop de controle ──────────────────────────────────────────────────
-    using Clock    = std::chrono::steady_clock;
     using Duration = std::chrono::duration<double>;
 
-    const Duration samplePeriod{Config::SAMPLE_PERIOD_S};
-    const Duration maxMeasAge{Config::MAX_MEASUREMENT_AGE_S};
-
-    auto nextCycle    = Clock::now() + samplePeriod;
     long cycleCount   = 0L;
     long missCount    = 0L;  ///< Ciclos com processamento mais lento que Ts
 
@@ -391,6 +503,12 @@ int main()
         const auto cycleStart = Clock::now();
         ++cycleCount;
 
+        // Período e validade da medição acompanham o Ts editado pelo usuário.
+        const Duration samplePeriod{gSamplePeriodS};
+        const Duration maxMeasAge{
+            std::max(Config::MAX_MEASUREMENT_AGE_S, 1.5 * gSamplePeriodS)};
+        const auto nextCycle = cycleStart + samplePeriod;
+
         // ── 5a. Captura e processa frame ─────────────────────────────────────
         const Image_Processing::Target_Measurement meas = imageProc.process_frame();
 
@@ -402,6 +520,8 @@ int main()
 
         std::optional<double> plotErrorX;
         std::optional<double> plotErrorY;
+        double errorX = 0.0;
+        double errorY = 0.0;
         double panMs  = servoDriver.get_pan_pulse_ms();
         double tiltMs = servoDriver.get_tilt_pulse_ms();
         bool panSat   = false;
@@ -409,8 +529,8 @@ int main()
 
         if (!gCtrl.running) {
             // Sistema parado: mantém os servos na posição atual, desliga o
-            // laser e deixa as trackbars editarem os ganhos ao vivo.
-            apply_trackbars_to_ctrl();
+            // laser e reflete no dashboard os valores editados no editor.
+            apply_editor_to_ctrl();
             laserDriver.turn_off();
             validMeas = false;
         } else if (!meas.valid) {
@@ -436,9 +556,9 @@ int main()
             // Liga o laser ao detectar o alvo
             laserDriver.turn_on();
 
-            // Erros de posição [px]
-            const double errorX = xRef - static_cast<double>(meas.x);
-            const double errorY = yRef - static_cast<double>(meas.y);
+            // Erros de posição [px] em relação à mira configurada
+            errorX = gRefX - static_cast<double>(meas.x);
+            errorY = gRefY - static_cast<double>(meas.y);
 
             // ── 5d. Executa os PIDs ──────────────────────────────────────────
             const Control::Pid_Output outX = pidX.calculate_output(errorX);
@@ -460,7 +580,7 @@ int main()
                           << ": falha no acionamento dos servos.\n";
             }
 
-            // Log periódico (a cada 20 ciclos ≈ 1 s a 20 Hz)
+            // Log periódico (a cada 20 ciclos)
             if (cycleCount % 20 == 0) {
                 std::cout << "[main] Ciclo " << cycleCount
                           << " | Alvo:(" << meas.x << "," << meas.y << ")"
@@ -473,8 +593,48 @@ int main()
             }
         }
 
+        // ── 5e1. Registra a amostra no log da sessão (inclusive falhas) ───────
+        if (gCtrl.running) {
+            Image_Processing::Error_Sample sample;
+            sample.sample  = ++gSessionSample;
+            sample.timeS   = Duration(Clock::now() - gSessionStart).count();
+            sample.valid   = validMeas;
+            sample.refX    = gRefX;
+            sample.refY    = gRefY;
+            sample.panMs   = panMs;
+            sample.tiltMs  = tiltMs;
+            sample.panSat  = panSat;
+            sample.tiltSat = tiltSat;
+
+            if (validMeas) {
+                sample.errorX  = errorX;
+                sample.errorY  = errorY;
+                sample.targetX = meas.x;
+                sample.targetY = meas.y;
+            }
+            gErrorLog.push(sample);
+
+            if (gErrorLog.full() && cycleCount % 100 == 0) {
+                std::cerr << "[main] AVISO: limite de "
+                          << Image_Processing::Error_Log::max_samples()
+                          << " amostras do CSV atingido. Salve o arquivo.\n";
+            }
+        }
+
         // ── 5e2. Atualiza janela única (câmera, gráfico e painel de controle)
         if (guiEnabled) {
+            sync_aim_preview();
+
+            const cv::Point aimPoint(
+                static_cast<int>(static_cast<double>(gFrameWidth) / 2.0 +
+                                 gAimOffsetX),
+                static_cast<int>(static_cast<double>(gFrameHeight) / 2.0 +
+                                 gAimOffsetY));
+
+            // Escala do gráfico acompanha a mira (maior erro possível no eixo).
+            errorPlot.set_max_abs(
+                std::max(gRefX, static_cast<double>(gFrameWidth) - gRefX),
+                std::max(gRefY, static_cast<double>(gFrameHeight) - gRefY));
             errorPlot.push_sample(plotErrorX, plotErrorY);
 
             const int divider = std::max(1, Config::GUI_UPDATE_DIVIDER);
@@ -491,7 +651,7 @@ int main()
                         lastFrame,
                         imageProc.get_last_mask(),
                         meas,
-                        centerRef,
+                        aimPoint,
                         statusLine,
                         errorPlot,
                         panMs,
@@ -508,14 +668,25 @@ int main()
             // Processa eventos da GUI em todo ciclo (resposta mais rápida).
             const int rawKey = cv::waitKey(1);
             if (rawKey >= 0) {
-                const int key = std::tolower(
-                    static_cast<unsigned char>(rawKey & 0xFF));
-                if (key == 27 || key == 'q') {
-                    gRunning.store(false);
-                } else if (key == 's') {
-                    set_running(!gCtrl.running, "tecla S");
+                // Enquanto um campo está ativo, as teclas pertencem ao editor.
+                if (!gPidEditor.handle_key(rawKey)) {
+                    const int key = std::tolower(
+                        static_cast<unsigned char>(rawKey & 0xFF));
+                    if (key == 27 || key == 'q') {
+                        gRunning.store(false);
+                    } else if (key == 's') {
+                        set_running(!gCtrl.running, "tecla S");
+                    }
                 }
             }
+
+            // Pedido de salvamento vindo do botão da janela de configurações.
+            if (gPidEditor.consume_save_request()) {
+                save_csv_now();
+            }
+
+            // Atualiza a janela de configurações (campos e status desenhados).
+            cv::imshow(kParamsWin, gPidEditor.render());
         }
 
         // ── 5f. Verifica atraso do ciclo ─────────────────────────────────────
@@ -530,12 +701,11 @@ int main()
                                  .count()
                           << " ms (misses acumulados: " << missCount << ").\n";
             }
-            // Avança o deadline para o próximo ciclo sem acumular atrasos
-            nextCycle = Clock::now() + samplePeriod;
+            // O deadline é recalculado no início de cada ciclo, então um Ts
+            // alterado ou um atraso não acumulam erro de temporização.
         } else {
             // ── 5g. Aguarda o restante do período ─────────────────────────────
             std::this_thread::sleep_until(nextCycle);
-            nextCycle += samplePeriod;
         }
     }
 

@@ -42,6 +42,8 @@ SRCS := main.cpp \
 HDRS := Config/config.hpp \
         Image_Processing/Image_Processor.hpp \
         Image_Processing/Camera_Display.hpp \
+        Image_Processing/Pid_Params_Editor.hpp \
+        Image_Processing/Error_Log.hpp \
         Control/Pid_Controller.hpp \
         Actuators/Servo_Driver.hpp \
         Actuators/Laser_Driver.hpp

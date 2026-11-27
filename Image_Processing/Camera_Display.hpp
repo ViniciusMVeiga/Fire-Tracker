@@ -28,8 +28,9 @@ namespace Image_Processing {
 /**
  * @brief Estado do painel de controle exibido no dashboard.
  *
- * Contém flag de execução e os seis ganhos dos dois PIDs.
- * Quando running == false, os ganhos podem ser editados via trackbars.
+ * Contém flag de execução, os seis ganhos dos dois PIDs e o período de
+ * amostragem e a mira. Quando running == false, os valores podem ser
+ * editados na janela de configurações (campos de texto), em valor real.
  */
 struct Control_Panel_State {
     bool   running = false;  ///< true → sistema em execução; false → parado/editável
@@ -43,6 +44,13 @@ struct Control_Panel_State {
     double kpY = 0.0;
     double kiY = 0.0;
     double kdY = 0.0;
+
+    /// Período de amostragem do loop/PIDs, em milissegundos.
+    double samplePeriodMs = 200.0;
+
+    /// Mira: deslocamento em pixels em relação ao centro da imagem.
+    double aimOffsetX = 0.0;  ///< +direita
+    double aimOffsetY = 0.0;  ///< +baixo
 
     /// Região (em coordenadas do canvas do dashboard) do botão Start/Stop.
     /// Preenchida pelo Dashboard_Renderer durante render() — usada pelo mouse callback.
@@ -122,6 +130,13 @@ public:
         , mMaxAbsErrorY(std::max(1.0, maxAbsErrorY))
         , mMaxSamples(std::max<std::size_t>(10, maxSamples))
     {}
+
+    /// Ajusta a escala vertical quando a mira é deslocada.
+    void set_max_abs(double maxAbsErrorX, double maxAbsErrorY)
+    {
+        mMaxAbsErrorX = std::max(1.0, maxAbsErrorX);
+        mMaxAbsErrorY = std::max(1.0, maxAbsErrorY);
+    }
 
     void push_sample(std::optional<double> errorX, std::optional<double> errorY)
     {
@@ -303,7 +318,7 @@ public:
 
         constexpr int kPanelWidth  = 440;
         constexpr int kPlotHeight  = 300;
-        constexpr int kControlH    = 180;  ///< altura do painel Start/Stop + ganhos
+        constexpr int kControlH    = 200;  ///< altura do painel Start/Stop + ganhos + Ts + mira
 
         const int camW  = cameraFrame.cols;
         const int camH  = cameraFrame.rows;
@@ -395,7 +410,7 @@ private:
 
         const std::string editHint = ctrlState.running
             ? ""
-            : "  (use trackbars para editar)";
+            : "  (janela de configuracoes)";
 
         // Cabeçalho
         cv::putText(canvas,
@@ -444,6 +459,21 @@ private:
                         cv::FONT_HERSHEY_SIMPLEX, 0.40, valueColor, 1, cv::LINE_8);
             y += 14;
         }
+
+        y += 4;
+        cv::putText(canvas,
+                    "Ts: " + format_decimal(ctrlState.samplePeriodMs, 1) + " ms",
+                    cv::Point(x0, y), cv::FONT_HERSHEY_SIMPLEX, 0.42,
+                    valueColor, 1, cv::LINE_8);
+
+        const std::string aimText =
+            std::string("Mira: ") +
+            (ctrlState.aimOffsetX >= 0.0 ? "+" : "") +
+            format_decimal(ctrlState.aimOffsetX, 1) + ", " +
+            (ctrlState.aimOffsetY >= 0.0 ? "+" : "") +
+            format_decimal(ctrlState.aimOffsetY, 1) + " px";
+        cv::putText(canvas, aimText, cv::Point(x0, y + 16),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.42, valueColor, 1, cv::LINE_8);
     }
 };
 
